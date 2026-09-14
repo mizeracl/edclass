@@ -1,0 +1,103 @@
+# Miscellaneous
+*.class
+*.log
+*.pyc
+*.swp
+.DS_Store
+.atom/
+.build/
+.buildlog/
+.history
+.svn/
+.swiftpm/
+migrate_working_dir/
+
+# IntelliJ related
+*.iml
+*.ipr
+*.iws
+.idea/
+
+# The .vscode folder contains launch configuration and tasks you configure in
+# VS Code which you may wish to be included in version control, so this line
+# is commented out by default.
+#.vscode/
+
+# Flutter/Dart/Pub related
+**/doc/api/
+**/ios/Flutter/.last_build_id
+.dart_tool/
+.flutter-plugins-dependencies
+.pub-cache/
+.pub/
+/build/
+/coverage/
+
+# Symbolication related
+app.*.symbols
+
+# Obfuscation related
+app.*.map.json
+
+# Android Studio will place build artifacts here
+/android/app/debug
+/android/app/profile
+/android/app/release
+
+# Widget Preview related
+.widget_preview/
+
+# --- Персональное / секреты / генерируемое ---
+
+# Firebase клиентские конфиги (содержат ключи проекта, не храним в репо).
+# Восстанавливаются командой  flutterfire configure
+# (пересоздаёт google-services.json, GoogleService-Info.plist, firebase_options.dart)
+android/app/google-services.json
+ios/Runner/GoogleService-Info.plist
+macos/Runner/GoogleService-Info.plist
+lib/core/config/firebase_options.dart
+
+# Секреты и ключи (служебные аккаунты, .env, keystore)
+.env
+.env.*
+**/.flutter-plugins
+**/firebase-export/
+*.jks
+*.keystore
+key.properties
+**/key.properties
+*service_account*.json
+*ServiceAccount*.json
+*.p12
+*.p8
+*.pem
+!**/test/*.pem
+
+# CocoaPods (генерируются из Podfile.lock, который храним в репо)
+ios/Pods/
+macos/Pods/
+
+# Эфемерные/генерируемые файлы Flutter-платформ
+ios/.symlinks/
+ios/Flutter/ephemeral/
+ios/Flutter/Generated.xcconfig
+ios/Flutter/flutter_export_environment.sh
+macos/.symlinks/
+macos/Flutter/ephemeral/
+macos/Flutter/GeneratedPluginRegistrant.swift
+macos/Flutter/flutter_export_environment.sh
+
+# Локальные пути машин (Android SDK и пр.)
+android/local.properties
+android/key.properties
+android/.gradle/
+
+# Собранный бинарник бэкенда
+/backend/server
+
+# Логи
+firebase-debug.log
+*.log
+
+# macOS
+.DS_Store
