@@ -1,8 +1,10 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:math' as math;
+import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart' show Clipboard, ClipboardData;
+import 'package:flutter/services.dart' show Clipboard, ClipboardData, SystemChannels;
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 
 import '../data/call_controller.dart';
@@ -59,6 +61,27 @@ class _MeetingRoomPageState extends State<MeetingRoomPage> {
   // Журнал диагностики рисования — показывается в диалоге «Диагностика».
   final List<String> _drawDebug = <String>[];
 
+  // --- Чат ---
+  // Открыт ли чат, все сообщения (свои и собеседника), ввод и автопрокрутка.
+  bool _chatOpen = false;
+  final List<_ChatMessage> _chatMessages = <_ChatMessage>[];
+  final TextEditingController _chatInput = TextEditingController();
+  final FocusNode _chatFocus = FocusNode();
+  final ScrollController _chatScroll = ScrollController();
+  StreamSubscription<Map<String, dynamic>>? _chatSub;
+  StreamSubscription<Map<String, dynamic>>? _boardImageSub;
+  // Непрочитанные входящие (счётчик на кнопке «Чат») и всплывашка,
+  // показывающая последнее пришедшее сообщение, пока чат закрыт.
+  int _unreadCount = 0;
+  _ChatMessage? _toastMsg;
+  Timer? _toastTimer;
+
+  // --- Реакции (по образцу Zoom) ---
+  // Открыта ли панель выбора эмодзи и активные вспышки реакций на экране.
+  bool _reactionPaletteOpen = false;
+  final List<_FlyingReaction> _reactions = <_FlyingReaction>[];
+  StreamSubscription<Map<String, dynamic>>? _reactionSub;
+
   void _dlog(String message) {
     debugPrint('[draw] $message');
     _drawDebug.add(message);
@@ -79,6 +102,215 @@ class _MeetingRoomPageState extends State<MeetingRoomPage> {
     });
   }
 
+  /// Принимает сообщения чата от собеседника и добавляет их в список.
+  /// Отправка своих сообщений выполняется в методе _sendChat: там же
+  /// сообщение кладётся в список сразу, чтобы не ждать ретрансляцию.
+  /// Если чат закрыт — копим счётчик непрочитанных и показываем всплывашку
+  /// с последним сообщением на несколько секунд.
+  void _onChatEvent(Map<String, dynamic> data) {
+    if (!mounted) return;
+    final text = data['text'] as String?;
+    if (text == null || text.isEmpty) return;
+    final msg = _ChatMessage(
+      from: (data['from'] as String?) ?? '',
+      name: (data['name'] as String?) ?? '',
+      text: text,
+      time: DateTime.now(),
+    );
+    final chatWasOpen = _chatOpen;
+    setState(() {
+      _chatMessages.add(msg);
+      if (!chatWasOpen) {
+        _unreadCount++;
+        _toastMsg = msg;
+      }
+    });
+    _toastTimer?.cancel();
+    if (!chatWasOpen) {
+      _toastTimer = Timer(const Duration(seconds: 5), () {
+        if (mounted) setState(() => _toastMsg = null);
+      });
+    }
+    _scrollChatToBottom();
+  }
+
+  /// Кладёт сообщение (текст или скрин доски) в чат, обновляя счётчик
+  /// непрочитанных и показывая всплывашку, если чат закрыт.
+  void _addChatMessage(_ChatMessage msg) {
+    if (!mounted) return;
+    final chatWasOpen = _chatOpen;
+    setState(() {
+      _chatMessages.add(msg);
+      if (!chatWasOpen) {
+        _unreadCount++;
+        _toastMsg = msg;
+      }
+    });
+    _toastTimer?.cancel();
+    if (!chatWasOpen) {
+      _toastTimer = Timer(const Duration(seconds: 5), () {
+        if (mounted) setState(() => _toastMsg = null);
+      });
+    }
+    _scrollChatToBottom();
+  }
+
+  /// Принимает скрин доски от собеседника — показывает его в чате.
+  void _onBoardImageEvent(Map<String, dynamic> data) {
+    if (!mounted) return;
+    final base64 = data['image'] as String?;
+    if (base64 == null || base64.isEmpty) return;
+    final msg = _ChatMessage(
+      from: (data['from'] as String?) ?? '',
+      name: (data['name'] as String?) ?? '',
+      text: 'Скрин доски',
+      time: DateTime.now(),
+      imageBase64: base64,
+    );
+    _addChatMessage(msg);
+  }
+
+  /// Принимает реакцию собеседника — добавляет «вспышку» на экран.
+  /// Вспышка привязывается к окну автора: чужая — над окном собеседника.
+  void _onReactionEvent(Map<String, dynamic> data) {
+    if (!mounted) return;
+    final emoji = data['emoji'] as String?;
+    if (emoji == null || emoji.isEmpty) return;
+    final from = data['from'] as String?;
+    setState(() {
+      _reactions.add(_FlyingReaction(
+        emoji: emoji,
+        mine: from != null && from == widget.uid,
+      ));
+    });
+  }
+
+  /// Отправляет своё сообщение, показывает его у себя сразу и очищает ввод.
+  void _sendChat() {
+    final text = _chatInput.text.trim();
+    if (text.isEmpty) return;
+    _controller.sendChatMessage(text, name: widget.name ?? '');
+    setState(() {
+      _chatMessages.add(_ChatMessage(
+        from: widget.uid,
+        name: widget.name ?? 'Вы',
+        text: text,
+        time: DateTime.now(),
+        mine: true,
+      ));
+      _chatInput.clear();
+    });
+    // Фокус возвращаем в следующем фрейме — иначе на мобильных после отправки
+    // (клавиша send/кнопка) клавиатура успевает закрыться, и фокус теряется.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _focusChatInput();
+    });
+    _scrollChatToBottom();
+  }
+
+  /// Захватывает текущее состояние доски (белый холст + штрихи) в PNG,
+  /// показывает картинку у себя в чате и отправляет её собеседнику.
+  /// Рисуем через ui.PictureRecorder, а не RepaintBoundary.toImage: видео на
+  /// web — платформенный элемент, его toImage дал бы пустоту, а штрихи у нас
+  /// уже нормализованы 0..1, так что белый фон + те же штрихи = честный скрин.
+  Future<void> _captureBoardShot() async {
+    if (_strokes.isEmpty && _activeStroke == null) return;
+    final aspect = _controller.screenAspect ?? (16 / 9);
+    const targetW = 1024.0;
+    final targetH = (targetW / (aspect <= 0 ? 16 / 9 : aspect)).roundToDouble();
+    final recorder = ui.PictureRecorder();
+    final c = Canvas(recorder);
+    c.drawRect(
+      Rect.fromLTWH(0, 0, targetW, targetH),
+      Paint()..color = Colors.white,
+    );
+    final paint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeCap = StrokeCap.round
+      ..strokeJoin = StrokeJoin.round;
+    for (final s in [..._strokes, if (_activeStroke != null) _activeStroke!]) {
+      if (s.points.length < 2) continue;
+      paint
+        ..color = s.color
+        ..strokeWidth = (s.width * targetW / 4).clamp(2.0, 26.0);
+      final path = Path()
+        ..moveTo(s.points.first.dx * targetW, s.points.first.dy * targetH);
+      for (final p in s.points.skip(1)) {
+        path.lineTo(p.dx * targetW, p.dy * targetH);
+      }
+      c.drawPath(path, paint);
+    }
+    final image = await recorder.endRecording()
+        .toImage(targetW.round(), targetH.round());
+    final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
+    image.dispose();
+    if (byteData == null) return;
+    final base64 = base64Encode(byteData.buffer.asUint8List());
+    if (base64.isEmpty) return;
+    if (!mounted) return;
+    final msg = _ChatMessage(
+      from: widget.uid,
+      name: widget.name ?? 'Вы',
+      text: 'Скрин доски',
+      time: DateTime.now(),
+      imageBase64: base64,
+    );
+    setState(() {
+      _chatMessages.add(msg);
+      _toastMsg = msg;
+    });
+    _toastTimer?.cancel();
+    _toastTimer = Timer(const Duration(seconds: 5), () {
+      if (mounted) setState(() => _toastMsg = null);
+    });
+    _sendBoardImage(base64);
+    _scrollChatToBottom();
+  }
+
+  /// Отправляет скрин собеседнику и (в отличие от чата) не добавляет его
+  /// локально — _captureBoardShot уже показал свой снимок сразу.
+  void _sendBoardImage(String base64) {
+    if (base64.isEmpty) return;
+    _controller.sendBoardImage(base64);
+  }
+
+  /// Отправляет реакцию и показывает её «вспышку» над своим окном.
+  void _sendReaction(String emoji) {
+    _controller.sendReaction(emoji);
+    setState(() {
+      _reactions.add(_FlyingReaction(emoji: emoji, mine: true));
+      _reactionPaletteOpen = false;
+    });
+  }
+
+  /// Убирает завершившуюся реакцию из списка активных вспышек.
+  void _removeReaction(_FlyingReaction r) {
+    if (!mounted) return;
+    setState(() => _reactions.remove(r));
+  }
+
+  void _scrollChatToBottom() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_chatScroll.hasClients) return;
+      _chatScroll.animateTo(
+        _chatScroll.position.maxScrollExtent,
+        duration: const Duration(milliseconds: 200),
+        curve: Curves.easeOut,
+      );
+    });
+  }
+
+  /// Ставит фокус в поле чата и принудительно показывает клавиатуру.
+  /// На Android/iOS с подключённой аппаратной клавиатурой обычный
+  /// requestFocus() не поднимает софтверную клавиатуру — нужен ещё
+  /// TextInput.show.
+  void _focusChatInput() {
+    _chatFocus.requestFocus();
+    try {
+      SystemChannels.textInput.invokeMethod<Object?>('TextInput.show');
+    } catch (_) {/* на web этот канал просто игнорируется */}
+  }
+
   @override
   void initState() {
     super.initState();
@@ -88,6 +320,9 @@ class _MeetingRoomPageState extends State<MeetingRoomPage> {
           (Object e, StackTrace st) => debugPrint('[call] Ошибка превью: $e'),
         ));
     _drawSub = _controller.drawEvents.listen(_onDrawEvent);
+    _chatSub = _controller.chatEvents.listen(_onChatEvent);
+    _boardImageSub = _controller.boardImageEvents.listen(_onBoardImageEvent);
+    _reactionSub = _controller.reactionEvents.listen(_onReactionEvent);
     _startAspectPoll();
   }
 
@@ -95,6 +330,13 @@ class _MeetingRoomPageState extends State<MeetingRoomPage> {
   void dispose() {
     _aspectPollTimer?.cancel();
     _drawSub?.cancel();
+    _chatSub?.cancel();
+    _boardImageSub?.cancel();
+    _reactionSub?.cancel();
+    _chatInput.dispose();
+    _chatFocus.dispose();
+    _chatScroll.dispose();
+    _toastTimer?.cancel();
     _controller.hangup();
     super.dispose();
   }
@@ -289,6 +531,8 @@ class _MeetingRoomPageState extends State<MeetingRoomPage> {
                       controller: _controller,
                       selfName: widget.name,
                       hasPeer: _controller.hasPeer,
+                      reactions: _reactions,
+                      onReactionEnd: _removeReaction,
                     ),
                   )
                 else ...[
@@ -580,6 +824,7 @@ class _MeetingRoomPageState extends State<MeetingRoomPage> {
                             setState(() => _strokes.clear());
                             _controller.sendWhiteboardClear();
                           },
+                          onShot: _captureBoardShot,
                         ),
                       ),
                     ),
@@ -612,6 +857,267 @@ class _MeetingRoomPageState extends State<MeetingRoomPage> {
                       ],
                     ),
                   ),
+
+                  // Вспышки реакций привязаны к окнам участников: моя — над
+                  // моим окном, собеседника — над его окном. В галерее их
+                  // рисует _GalleryView поверх соответствующих плиток;
+                  // универсальный оверлей ниже — только вне галереи.
+                  if (joined && !galleryMode && _reactions.isNotEmpty)
+                    Positioned.fill(
+                      child: IgnorePointer(
+                        child: Stack(
+                          fit: StackFit.expand,
+                          children: [
+                            for (final r in _reactions)
+                              _ReactionBurst(
+                                key: ValueKey(r.id),
+                                reaction: r,
+                                onEnd: () => _removeReaction(r),
+                              ),
+                          ],
+                        ),
+                      ),
+                    ),
+
+                  // Панель выбора реакции (по образцу Zoom): открывается
+                  // кнопкой «Реакции» и прячется после выбора эмодзи.
+                  if (joined && _reactionPaletteOpen)
+                    Positioned(
+                      left: 0,
+                      right: 0,
+                      // Палитра должна быть ВЫШЕ панели управления: нижняя
+                      // панель с градиентом перехватывает клики по своей
+                      // прямоугольной области даже в прозрачной части, и
+                      // иначе нижняя половинка эмодзи не нажимается.
+                      bottom: 140,
+                      child: Center(
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 6, vertical: 6),
+                          decoration: BoxDecoration(
+                            color: const Color(0xE6222222),
+                            borderRadius: BorderRadius.circular(24),
+                            boxShadow: [
+                              BoxShadow(
+                                color: Colors.black.withValues(alpha: 0.4),
+                                blurRadius: 12,
+                              ),
+                            ],
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              for (final e in _reactionEmojis)
+                                InkWell(
+                                  borderRadius: BorderRadius.circular(24),
+                                  onTap: () => _sendReaction(e),
+                                  // Фиксированный квадрат: у эмодзи на web
+                                  // жидкий рендер-бокс уже визуального глифа,
+                                  // поэтому без жёсткой тач-зоны нижняя часть
+                                  // эмодзи не попадает под клик.
+                                  child: SizedBox(
+                                    width: 44,
+                                    height: 44,
+                                    child: Center(
+                                      child: Text(
+                                          e, style: const TextStyle(
+                                              fontSize: 26)),
+                                    ),
+                                  ),
+                                ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+
+                  // Чат: список сообщений + поле ввода поверх панели управления.
+                  // bottom: 140 — чтобы поле ввода не перекрывалось нижней
+                  // панелью управления (она перехватывает клики всей площадью,
+                  // включая прозрачный градиент), как уже сделано для палитры реакций.
+                  if (joined && _chatOpen)
+                    Positioned(
+                      left: 8,
+                      right: 8,
+                      bottom: 140,
+                      child: Container(
+                        height: math.min(MediaQuery.of(context).size.height *
+                            0.42, 320),
+                        decoration: BoxDecoration(
+                          color: const Color(0xF21B1B1B),
+                          borderRadius: BorderRadius.circular(16),
+                          border: Border.all(color: Colors.white12),
+                        ),
+                        clipBehavior: Clip.antiAlias,
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            Padding(
+                              padding: const EdgeInsets.fromLTRB(
+                                  16, 10, 8, 6),
+                              child: Row(
+                                children: [
+                                  const Text(
+                                    'Чат',
+                                    style: TextStyle(
+                                        color: Colors.white,
+                                        fontSize: 14,
+                                        fontWeight: FontWeight.w700),
+                                  ),
+                                  const Spacer(),
+                                  IconButton(
+                                    icon: const Icon(Icons.close,
+                                        color: Colors.white70, size: 20),
+                                    visualDensity: VisualDensity.compact,
+                                    onPressed: () => setState(
+                                        () => _chatOpen = false),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            const Divider(height: 1, color: Colors.white12),
+                            Expanded(
+                              child: _chatMessages.isEmpty
+                                  ? const Center(
+                                      child: Text(
+                                        'Сообщений пока нет.\nНапишите первым!',
+                                        textAlign: TextAlign.center,
+                                        style: TextStyle(
+                                            color: Colors.white38,
+                                            fontSize: 13),
+                                      ),
+                                    )
+                                  : ListView.builder(
+                                      controller: _chatScroll,
+                                      padding: const EdgeInsets.all(12),
+                                      itemCount: _chatMessages.length,
+                                      itemBuilder: (context, i) {
+                                        final m = _chatMessages[i];
+                                        return _ChatBubble(message: m);
+                                      },
+                                    ),
+                            ),
+                            const Divider(height: 1, color: Colors.white12),
+                            Padding(
+                              padding: const EdgeInsets.fromLTRB(
+                                  8, 6, 8, 8),
+                              child: Row(
+                                children: [
+                                  Expanded(
+                                    child: TextField(
+                                      controller: _chatInput,
+                                      focusNode: _chatFocus,
+                                      style: const TextStyle(
+                                          color: Colors.white, fontSize: 14),
+                                      cursorColor: Colors.amber,
+                                      decoration: InputDecoration(
+                                        hintText: 'Написать сообщение…',
+                                        hintStyle: const TextStyle(
+                                            color: Colors.white38,
+                                            fontSize: 14),
+                                        isDense: true,
+                                        filled: true,
+                                        fillColor: Colors.white10,
+                                        contentPadding:
+                                            const EdgeInsets.symmetric(
+                                                horizontal: 14, vertical: 10),
+                                        border: OutlineInputBorder(
+                                          borderRadius:
+                                              BorderRadius.circular(20),
+                                          borderSide: BorderSide.none,
+                                        ),
+                                      ),
+                                      textInputAction: TextInputAction.send,
+                                      onSubmitted: (_) => _sendChat(),
+                                    ),
+                                  ),
+                                  const SizedBox(width: 6),
+                                  IconButton.filled(
+                                    icon: const Icon(Icons.send, size: 18),
+                                    visualDensity: VisualDensity.compact,
+                                    style: IconButton.styleFrom(
+                                      backgroundColor: Colors.amber,
+                                      foregroundColor: Colors.black,
+                                    ),
+                                    onPressed: _sendChat,
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+
+                  // Всплывашка «новое сообщение»: показывается над панелью
+                  // управления, пока чат закрыт. Тап по ней открывает чат.
+                  if (joined && _toastMsg != null)
+                    Positioned(
+                      left: 16,
+                      right: 16,
+                      bottom: 165,
+                      child: Material(
+                        color: Colors.transparent,
+                        child: InkWell(
+                          borderRadius: BorderRadius.circular(14),
+                          onTap: () {
+                            setState(() {
+                              _chatOpen = true;
+                              _reactionPaletteOpen = false;
+                              _toastMsg = null;
+                            });
+                            _toastTimer?.cancel();
+                            WidgetsBinding.instance
+                                .addPostFrameCallback((_) {
+                              if (mounted) _focusChatInput();
+                            });
+                          },
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 14, vertical: 10),
+                            decoration: BoxDecoration(
+                              color: const Color(0xF2222B33),
+                              borderRadius: BorderRadius.circular(14),
+                              border: Border.all(color: Colors.white24),
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                const Icon(Icons.chat, color: Colors.amber,
+                                    size: 18),
+                                const SizedBox(width: 8),
+                                Flexible(
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Text(
+                                        _toastMsg!.name.isNotEmpty
+                                            ? _toastMsg!.name
+                                            : 'Собеседник',
+                                        style: const TextStyle(
+                                            color: Colors.amber,
+                                            fontSize: 12,
+                                            fontWeight: FontWeight.w700),
+                                      ),
+                                      Text(
+                                        _toastMsg!.text,
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: const TextStyle(
+                                            color: Colors.white,
+                                            fontSize: 13),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
 
                   // Панель управления
                   Positioned(
@@ -713,6 +1219,42 @@ class _MeetingRoomPageState extends State<MeetingRoomPage> {
                                   .setStudentSharingAllow(
                                       !_controller.studentsCanShare),
                             ),
+                          _ControlButton(
+                            icon: _chatOpen
+                                ? Icons.chat_bubble
+                                : Icons.chat_bubble_outline,
+                            label: 'Чат',
+                            active: _chatOpen,
+                            badge: _unreadCount,
+                            onTap: () {
+                              final wasOpen = _chatOpen;
+                              setState(() {
+                                _chatOpen = !_chatOpen;
+                                _reactionPaletteOpen = false;
+                                if (!wasOpen) {
+                                  _unreadCount = 0;
+                                  _toastMsg = null;
+                                }
+                              });
+                              _toastTimer?.cancel();
+                              // Открыли чат — сразу фокус на поле ввода,
+                              // чтобы клавиатура показалась сама (Android/iOS).
+                              if (!wasOpen) {
+                                WidgetsBinding.instance
+                                    .addPostFrameCallback((_) {
+                                  if (mounted) _focusChatInput();
+                                });
+                              }
+                            },
+                          ),
+                          _ControlButton(
+                            icon: Icons.emoji_emotions,
+                            label: 'Реакции',
+                            active: _reactionPaletteOpen,
+                            onTap: () => setState(() {
+                              _reactionPaletteOpen = !_reactionPaletteOpen;
+                            }),
+                          ),
                           _EndCallButton(
                             onTap: () async {
                               await _controller.hangup();
@@ -756,11 +1298,15 @@ class _GalleryView extends StatelessWidget {
     required this.controller,
     required this.selfName,
     required this.hasPeer,
+    required this.reactions,
+    required this.onReactionEnd,
   });
 
   final CallController controller;
   final String? selfName;
   final bool hasPeer;
+  final List<_FlyingReaction> reactions;
+  final ValueChanged<_FlyingReaction> onReactionEnd;
 
   @override
   Widget build(BuildContext context) {
@@ -768,34 +1314,41 @@ class _GalleryView extends StatelessWidget {
         (controller.remoteName?.isNotEmpty ?? false) && controller.remoteName != null
             ? controller.remoteName!
             : 'Участник';
+    // Мои реакции всплывают над моим окном, чужие — над окном собеседника.
+    final myReactions = reactions.where((r) => r.mine).toList();
+    final peerReactions = reactions.where((r) => !r.mine).toList();
     return LayoutBuilder(
       builder: (context, constraints) {
-        final tiles = <Widget>[
-          Expanded(
-            child: _ParticipantTile(
-              label: (selfName?.isNotEmpty ?? false)
-                  ? selfName!
-                  : 'Вы',
-              renderer: controller.localRenderer,
-              hasVideo: controller.localRenderer.srcObject != null,
-              isSelf: true,
-              micEnabled: controller.micEnabled,
-              cameraEnabled: controller.cameraEnabled,
-            ),
-          ),
-          Expanded(
-            child: _ParticipantTile(
-              label: hasPeer ? remoteName : 'Ожидание...',
-              renderer: controller.remoteRenderer,
-              hasVideo: controller.remoteRenderer.srcObject != null,
-              isSelf: false,
-              speaking: controller.remoteSpeaking,
-              waiting: !hasPeer,
-              micEnabled: controller.remoteMicEnabled,
-              cameraEnabled: controller.remoteCameraEnabled,
-            ),
-          ),
-        ];
+    final tiles = <Widget>[
+      Expanded(
+        child: _ParticipantTile(
+          label: (selfName?.isNotEmpty ?? false)
+              ? selfName!
+              : 'Вы',
+          renderer: controller.localRenderer,
+          hasVideo: controller.localRenderer.srcObject != null,
+          isSelf: true,
+          micEnabled: controller.micEnabled,
+          cameraEnabled: controller.cameraEnabled,
+          reactions: myReactions,
+          onReactionEnd: onReactionEnd,
+        ),
+      ),
+      Expanded(
+        child: _ParticipantTile(
+          label: hasPeer ? remoteName : 'Ожидание...',
+          renderer: controller.remoteRenderer,
+          hasVideo: controller.remoteRenderer.srcObject != null,
+          isSelf: false,
+          speaking: controller.remoteSpeaking,
+          waiting: !hasPeer,
+          micEnabled: controller.remoteMicEnabled,
+          cameraEnabled: controller.remoteCameraEnabled,
+          reactions: peerReactions,
+          onReactionEnd: onReactionEnd,
+        ),
+      ),
+    ];
         if (constraints.maxWidth >= 640) {
           // Широкий экран — участники рядом друг с другом.
           return Row(children: tiles);
@@ -810,8 +1363,6 @@ class _GalleryView extends StatelessWidget {
     );
   }
 }
-
-/// Окно одного участника в галерее: видео, имя, индикатор «говорит».
 /// Если видео нет — заглушка с понятным статусом.
 class _ParticipantTile extends StatelessWidget {
   const _ParticipantTile({
@@ -823,6 +1374,8 @@ class _ParticipantTile extends StatelessWidget {
     this.waiting = false,
     this.micEnabled,
     this.cameraEnabled,
+    this.reactions = const [],
+    this.onReactionEnd,
   });
 
   final String label;
@@ -833,6 +1386,8 @@ class _ParticipantTile extends StatelessWidget {
   final bool waiting;
   final bool? micEnabled;
   final bool? cameraEnabled;
+  final List<_FlyingReaction> reactions;
+  final ValueChanged<_FlyingReaction>? onReactionEnd;
 
   @override
   Widget build(BuildContext context) {
@@ -842,9 +1397,13 @@ class _ParticipantTile extends StatelessWidget {
         borderRadius: BorderRadius.circular(16),
         child: Container(
           color: const Color(0xFF161616),
-          child: Stack(
-            fit: StackFit.expand,
-            children: [
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              final w = constraints.maxWidth;
+              final h = constraints.maxHeight;
+              return Stack(
+                fit: StackFit.expand,
+                children: [
               if (hasVideo)
                 RTCVideoView(
                   renderer,
@@ -873,6 +1432,19 @@ class _ParticipantTile extends StatelessWidget {
                             color: Colors.white54, fontSize: 13),
                       ),
                     ],
+                  ),
+                ),
+              // Вспышки реакций этого участника — поверх его окна.
+              for (final r in reactions)
+                Positioned(
+                  left: (w - 56) * r.rateX,
+                  top: (h * 0.45) * r.rateY + h * 0.2,
+                  child: IgnorePointer(
+                    child: _ReactionBurst(
+                      key: ValueKey(r.id),
+                      reaction: r,
+                      onEnd: () => onReactionEnd?.call(r),
+                    ),
                   ),
                 ),
               Positioned(
@@ -949,9 +1521,11 @@ class _ParticipantTile extends StatelessWidget {
                         ),
                     ],
                   ),
-                ),
-              ),
+),
+               ),
             ],
+              );
+            },
           ),
         ),
       ),
@@ -1516,6 +2090,7 @@ class _ControlButton extends StatelessWidget {
     required this.active,
     required this.onTap,
     this.enabled = true,
+    this.badge = 0,
   });
 
   final IconData icon;
@@ -1523,6 +2098,9 @@ class _ControlButton extends StatelessWidget {
   final bool active;
   final VoidCallback onTap;
   final bool enabled;
+  // Счётчик непрочитанных сообщений чата: рисуется красной точкой
+  // в углу кнопки, пока чат закрыт и есть новые входящие.
+  final int badge;
 
   @override
   Widget build(BuildContext context) {
@@ -1538,14 +2116,48 @@ class _ControlButton extends StatelessWidget {
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Container(
-                width: 52,
-                height: 52,
-                decoration: BoxDecoration(
-                  color: active ? Colors.white24 : Colors.white12,
-                  borderRadius: BorderRadius.circular(16),
-                ),
-                child: Icon(icon, color: color),
+              Stack(
+                clipBehavior: Clip.none,
+                children: [
+                  Container(
+                    width: 52,
+                    height: 52,
+                    decoration: BoxDecoration(
+                      color: active ? Colors.white24 : Colors.white12,
+                      borderRadius: BorderRadius.circular(16),
+                    ),
+                    child: Icon(icon, color: color),
+                  ),
+                  if (badge > 0)
+                    Positioned(
+                      right: -4,
+                      top: -4,
+                      child: Container(
+                        constraints: const BoxConstraints(
+                          minWidth: 18,
+                          minHeight: 18,
+                        ),
+                        padding: const EdgeInsets.symmetric(horizontal: 5),
+                        decoration: BoxDecoration(
+                          color: Colors.red.shade600,
+                          borderRadius: BorderRadius.circular(9),
+                          border: Border.all(
+                            color: const Color(0xF2181818),
+                            width: 1.5,
+                          ),
+                        ),
+                        child: Text(
+                          badge > 9 ? '9+' : '$badge',
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 11,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ),
+                    ),
+                ],
               ),
               const SizedBox(height: 4),
               Text(
@@ -2065,11 +2677,13 @@ class _DrawingPalette extends StatelessWidget {
     required this.selected,
     required this.onColorSelected,
     required this.onClear,
+    required this.onShot,
   });
 
   final Color selected;
   final ValueChanged<Color> onColorSelected;
   final VoidCallback onClear;
+  final VoidCallback onShot;
 
   static const _colors = <Color>[
     Color(0xFFFFEE00), // жёлтый
@@ -2117,7 +2731,7 @@ class _DrawingPalette extends StatelessWidget {
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 4),
             child: InkWell(
-              onTap: onClear,
+              onTap: onShot,
               borderRadius: BorderRadius.circular(16),
               child: Container(
                 width: 26,
@@ -2126,12 +2740,245 @@ class _DrawingPalette extends StatelessWidget {
                   color: Colors.white12,
                   shape: BoxShape.circle,
                 ),
-                child: const Icon(Icons.layers_clear, size: 16, color: Colors.white),
+                child: const Icon(Icons.image_outlined,
+                    size: 16, color: Colors.white),
               ),
             ),
           ),
         ],
       ),
+    );
+  }
+}
+
+// --- Сообщение чата ---
+const List<String> _reactionEmojis = [
+  '👍',
+  '❤️',
+  '👏',
+  '🎉',
+  '😂',
+  '😮',
+  '😢',
+  '🔥',
+];
+
+// --- Сообщение чата ---
+/// Сообщение чата: текст и/или картинка (PNG в base64, без префикса data:).
+class _ChatMessage {
+  const _ChatMessage({
+    required this.from,
+    required this.name,
+    required this.text,
+    required this.time,
+    this.imageBase64,
+    this.mine = false,
+  });
+
+  final String from;
+  final String name;
+  final String text;
+  final DateTime time;
+  final String? imageBase64;
+  final bool mine;
+
+  /// Есть ли в сообщении картинка (скрин доски).
+  bool get hasImage => imageBase64 != null && imageBase64!.isNotEmpty;
+}
+
+// --- Пузырь сообщения чата (свой справа, чужой слева с именем) ---
+class _ChatBubble extends StatelessWidget {
+  const _ChatBubble({required this.message});
+
+  final _ChatMessage message;
+
+  @override
+  Widget build(BuildContext context) {
+    final mine = message.mine;
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Row(
+        mainAxisAlignment:
+            mine ? MainAxisAlignment.end : MainAxisAlignment.start,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (!mine)
+            Flexible(
+              child: Container(
+                constraints: BoxConstraints(
+                  maxWidth: MediaQuery.of(context).size.width * 0.70,
+                ),
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF2A2A2A),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    if (message.name.isNotEmpty)
+                      Text(
+                        message.name,
+                        style: const TextStyle(
+                          color: Colors.amber,
+                          fontSize: 11,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    const SizedBox(height: 2),
+                    Text(
+                      message.text,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 13,
+                      ),
+                    ),
+                    if (message.imageBase64 != null && message.imageBase64!.isNotEmpty)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 4),
+                        child: ClipRRect(
+                          borderRadius: BorderRadius.circular(8),
+                          child: Image.memory(
+                            base64Decode(message.imageBase64!),
+                            height: 140,
+                            fit: BoxFit.cover,
+                            gaplessPlayback: true,
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+            ),
+          if (mine)
+            Flexible(
+              child: Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF3B6EA5),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      message.text,
+                      style: const TextStyle(
+                          color: Colors.white, fontSize: 13),
+                    ),
+                    if (message.hasImage)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 4),
+                        child: ClipRRect(
+                          borderRadius: BorderRadius.circular(8),
+                          child: Image.memory(
+                            base64Decode(message.imageBase64!),
+                            height: 140,
+                            fit: BoxFit.cover,
+                            gaplessPlayback: true,
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+// --- Активная «вспышка» реакции ---
+// Привязана к окну автора: mine=true — всплывает над моим окном,
+// mine=false — над окном собеседника (реакция показана НЕ мной).
+class _FlyingReaction {
+  _FlyingReaction({required this.emoji, required this.mine})
+      : id = _reactionId++,
+        rateX = 0.1 + _rng.nextDouble() * 0.8,
+        rateY = 0.15 + _rng.nextDouble() * 0.35;
+
+  static int _reactionId = 0;
+  static final math.Random _rng = math.Random();
+
+  final int id;
+  final String emoji;
+  final bool mine;
+  final double rateX; // позиция внутри окна, 0..1
+  final double rateY; // позиция внутри окна, 0..1
+}
+
+class _ReactionBurst extends StatefulWidget {
+  const _ReactionBurst({
+    super.key,
+    required this.reaction,
+    required this.onEnd,
+  });
+
+  final _FlyingReaction reaction;
+  final VoidCallback onEnd;
+
+  @override
+  State<_ReactionBurst> createState() => _ReactionBurstState();
+}
+
+class _ReactionBurstState extends State<_ReactionBurst>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _c = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 1800),
+  )..forward().whenComplete(widget.onEnd);
+
+  @override
+  void dispose() {
+    _c.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // Вспышка — чистая анимация; её размещение в окне участника делает
+    // родитель (Stack + Positioned), поэтому здесь нет ни LayoutBuilder,
+    // ни Positioned — ParentData обязан применяться прямо к Stack.
+    final r = widget.reaction;
+    return AnimatedBuilder(
+      animation: _c,
+      builder: (context, _) {
+        final t = _c.value;
+        // Всплытие вверх по дуге и растворение к концу.
+        final rise = Curves.easeOut.transform(t);
+        final fade = t < 0.25 ? 1.0 : (1 - (t - 0.25) / 0.75).clamp(0.0, 1.0);
+        final scale = t < 0.2
+            ? 0.5 + 0.5 * Curves.elasticOut.transform(t / 0.2)
+            : 1.0;
+        return Transform.translate(
+          offset: Offset(0, -60 * rise),
+          child: IgnorePointer(
+            child: Opacity(
+              opacity: fade,
+              child: Transform.scale(
+                scale: scale,
+                child: Text(
+                  r.emoji,
+                  style: const TextStyle(
+                    fontSize: 56,
+                    shadows: [
+                      Shadow(
+                        color: Colors.black45,
+                        blurRadius: 12,
+                        offset: Offset(0, 2),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+      },
     );
   }
 }

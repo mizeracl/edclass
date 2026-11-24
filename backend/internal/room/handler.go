@@ -9,18 +9,65 @@ import (
 	"github.com/gofiber/websocket/v2"
 )
 
+// Identity — доверенная личность участника, установленная верификатором
+// auth (проверенный Firebase токен + Firestore-профиль). Пакет room намеренно
+// не импортирует internal/auth: проверка инжектируется снаружи из main.
+type Identity struct {
+	UID  string
+	Name string
+	Role string
+}
+
+// TokenVerifier проверяет сырой Firebase ID-токен (пришедший строкой в query
+// у WebSocket) и возвращает доверенную личность. Если токен невалиден —
+// соединение отклоняется ещё до добавления в комнату.
+type TokenVerifier func(rawToken string) (Identity, error)
+
 // NewSignalingHandler создаёт WebSocket-обработчик комнаты встречи.
 //
-// URL:  GET /ws/meetings/:meetingId?uid=<userId>&name=<name>&teacher=1|0
+// URL:  GET /ws/meetings/:meetingId?token=<firebaseIdToken>
 // Сервер назначает роли offerer/answerer, следит за одиночной трансляцией
 // экрана (и приоритетом учителя перед учениками) и ретранслирует
 // SDP/ICE и служебные пакеты между участниками.
-func NewSignalingHandler(hub *Hub) fiber.Handler {
+//
+// verify может быть nil — тогда (только в dev без FIREBASE_CREDENTIALS)
+// личность берётся из query uid/name/teacher, чтобы сигналинг работал без
+// реального Firebase. В проде verify обязан быть непустым, иначе клиент,
+// подделавший одну строку ?uid=...&teacher=1, получил бы чужой кабинет.
+func NewSignalingHandler(hub *Hub, verify TokenVerifier) fiber.Handler {
 	return websocket.New(func(c *websocket.Conn) {
 		meetingID := c.Params("meetingId")
-		uid := c.Query("uid")
-		name := c.Query("name")
-		isTeacher := c.Query("teacher") == "1"
+
+		var (
+			uid       string
+			name      string
+			isTeacher bool
+		)
+
+		if verify != nil {
+			// Идентичность — СТРОГО из проверенного токена. query с uid/name/
+			// teacher здесь игнорируется: его клиент подделывает одной строкой.
+			ident, err := verify(c.Query("token"))
+			if err != nil {
+				_ = c.WriteMessage(websocket.CloseMessage,
+					websocket.FormatCloseMessage(websocket.ClosePolicyViolation,
+						"Невалидный токен авторизации"))
+				return
+			}
+			uid = ident.UID
+			name = ident.Name
+			role := ident.Role
+			if role == "" {
+				role = "student"
+			}
+			isTeacher = role == "teacher"
+		} else {
+			// Dev-fallback без Firebase: роль из query. Небезопасно, поэтому
+			// возможен только когда сервер запущен без credentials (см. main).
+			uid = c.Query("uid")
+			name = c.Query("name")
+			isTeacher = c.Query("teacher") == "1"
+		}
 
 		if meetingID == "" || uid == "" {
 			_ = c.WriteMessage(websocket.CloseMessage,
@@ -92,10 +139,30 @@ func NewSignalingHandler(hub *Hub) fiber.Handler {
 		defer pingTicker.Stop()
 
 		// Канал записи: цикл пишет и данные, и пинги по очереди.
+		// ФоновАЯ горутина — а отдельная потому, что для соединения нужен
+		// сразу и читающий, и пишущий цикл (см. ниже главный read-loop).
+		// fiber-recover-мидлвара НЕ покрывает дочерние горутины: паника
+		// всплыла бы в main-горутине fiber и уронила бы весь процесс. Поэтому
+		// вешаем свой recover — ибо в WS-цикле паники бывают (нестандартный
+		// кадр, кадр с переполненным заголовком), и ценой одной паники
+		// собеседник должен получить закрытое соединение, а не весь сервер.
 		writeStop := make(chan struct{})
 		done := make(chan struct{})
-		go func() {
+		startWriteLoop := func() {
+			// done закрывается и при нормальном выходе, и при выходе после
+			// паники: по нему основной read-loop (после <readDone> внизу)
+			// понимает, что писать некому, и больше не ждёт нас — иначе
+			// при панике держал бы соединение «на весу» до самого pongDeadline.
 			defer close(done)
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("room %s: паника в write-loop клиента %s: %v — закрываю соединение",
+						meetingID, uid, r)
+					_ = c.WriteMessage(websocket.CloseMessage,
+						websocket.FormatCloseMessage(websocket.CloseAbnormalClosure,
+							"Внутренняя ошибка сервера"))
+				}
+			}()
 			for {
 				select {
 				case msg := <-client.send:
@@ -112,7 +179,8 @@ func NewSignalingHandler(hub *Hub) fiber.Handler {
 					return
 				}
 			}
-		}()
+		}
+		go startWriteLoop()
 
 		// Читаем входящие сообщения. Лимит размера большой: offer после
 		// включения экрана (звук + камера + экран) легко превышает 4 КБ,
@@ -124,6 +192,15 @@ func NewSignalingHandler(hub *Hub) fiber.Handler {
 			_, data, err := c.ReadMessage()
 			if err != nil {
 				log.Printf("room %s: клиент %s закрыл соединение: %v", meetingID, uid, err)
+				break
+			}
+			// Пока это соединение ещё участник комнаты? Если его заменило новое
+			// (тот же uid переподключился с другого устройства) — старый
+			// websocket больше не ретранслируем: его сообщения могут нести
+			// устаревшие offer/ice и сбивать настоящего собеседника.
+			if client.superseded {
+				log.Printf("room %s: клиент %s заменён новым соединением, старый закрыт",
+					meetingID, uid)
 				break
 			}
 			if err != nil {
@@ -138,8 +215,13 @@ func NewSignalingHandler(hub *Hub) fiber.Handler {
 			switch m.Type {
 			case TypeLeave:
 				left = true
-			case TypeOffer, TypeAnswer, TypeIce, TypeDevice, TypeRenegotiate, TypeDraw:
+			case TypeOffer, TypeAnswer, TypeIce, TypeDevice, TypeRenegotiate, TypeDraw,
+				TypeChat, TypeReaction, TypeBoardImage:
 				m.From = uid
+				if m.Type == TypeIce {
+					log.Printf("room %s: relaying ice from %s (payload=%d bytes)",
+						meetingID, uid, len(data))
+				}
 				hub.Broadcast(meetingID, client, mustMarshal(m))
 			case TypeScreen:
 				handleScreen(hub, meetingID, client, m)

@@ -27,6 +27,10 @@ type Message struct {
 	Clear     bool            `json:"clear,omitempty"`
 	SDP       json.RawMessage `json:"sdp,omitempty"`
 	Candidate json.RawMessage `json:"candidate,omitempty"`
+	Ice       json.RawMessage `json:"ice,omitempty"`
+	Text      string          `json:"text,omitempty"`  // текст сообщения чата
+	Emoji     string          `json:"emoji,omitempty"` // эмодзи реакции
+	Image     string          `json:"image,omitempty"` // PNG-снимок доски (base64)
 }
 
 // Типы сообщений протокола.
@@ -46,6 +50,9 @@ const (
 	TypeShareDenied = "share-denied"
 	TypeRenegotiate = "renegotiate"
 	TypeDraw        = "draw"
+	TypeChat        = "chat"
+	TypeReaction    = "reaction"
+	TypeBoardImage  = "board-image"
 )
 
 // Client — один подключённый к комнате участник.
@@ -115,12 +122,16 @@ func (h *Hub) AddClient(id, roomID, name string, isTeacher bool) *Client {
 	// Если от этого же пользователя уже есть живое соединение (перезагрузка
 	// страницы или переподключение), старое объявляем заменённым: его
 	// «прощание» не должно рассылать peer-leave и снимать трансляцию экрана
-	// у только что пришедшего нового соединения.
+	// у только что пришедшего нового соединения. Заменённое соединение сразу
+	// убираем из комнаты — иначе оно ещё до 90 секунд (pongDeadline)
+	// числится среди участников, а собеседник остаётся с признаком живого
+	// пира и не пересобирает медиа при новом входе с другого устройства.
 	superseded := false
 	for p := range peers {
 		if p.id == id {
 			p.superseded = true
 			superseded = true
+			delete(peers, p)
 		}
 	}
 

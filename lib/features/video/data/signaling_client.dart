@@ -21,12 +21,20 @@ class SignalingClient {
     required this.uid,
     this.name,
     this.isTeacher = false,
+    this.getToken,
   });
 
   final String meetingId;
   final String uid;
   final String? name;
   final bool isTeacher;
+
+  /// Возвращает свежий Firebase ID-токен для аутентификации на сигнальном
+  /// сервере. Во-первых, он короткоживущий (час), поэтому его нужно запрашивать
+  /// именно перед подключением. Во-вторых — сервер НЕ доверяет uid/name/teacher
+  /// из URL: личность он делает только из проверенного токена. Без токена
+  /// соединение с рабочим сервером отклоняется.
+  final Future<String?> Function()? getToken;
 
   WebSocketChannel? _channel;
   StreamSubscription<dynamic>? _sub;
@@ -49,12 +57,15 @@ class SignalingClient {
   /// Есть ли прямо сейчас живое соединение с сервером.
   bool get isConnected => _connected;
 
-  Uri _buildUri() {
+  Uri _buildUri({String? token}) {
     final nameParam =
         name == null ? '' : '&name=${Uri.encodeQueryComponent(name!)}';
     final teacherParam = isTeacher ? '&teacher=1' : '';
+    final tokenParam = (token != null && token.isNotEmpty)
+        ? '&token=${Uri.encodeQueryComponent(token)}'
+        : '';
     return Uri.parse(
-        '${ApiConfig.signalingUrl}/ws/meetings/$meetingId?uid=$uid$nameParam$teacherParam');
+        '${ApiConfig.signalingUrl}/ws/meetings/$meetingId?uid=$uid$nameParam$teacherParam$tokenParam');
   }
 
   /// Первое подключение (или повторная попытка из цикла автовосстановления).
@@ -69,7 +80,22 @@ class SignalingClient {
       _sub = null;
       _channel = null;
       await oldSub?.cancel();
-      final channel = WebSocketChannel.connect(_buildUri());
+
+      // Свежий Firebase ID-токен получаем именно в момент подключения: он
+      // короткоживущий (~1 час), а запрошенный заранее может истечь до того,
+      // как WebSocket реально установится. Если токена нет (dev без Firebase)
+      // — сигнальный сервер в упрощённом режиме пустит и так.
+      String? token;
+      if (getToken != null) {
+        try {
+          token = await getToken!();
+        } catch (_) {
+          // Токен не получить — коннектимся без него (dev-сервер пропустит,
+          // прод-сервер ответит закрытием, и мы переподключимся с новым).
+        }
+      }
+
+      final channel = WebSocketChannel.connect(_buildUri(token: token));
       _channel = channel;
       _sub = channel.stream.listen(
         (event) {

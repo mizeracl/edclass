@@ -3,6 +3,7 @@ import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 
 import 'signaling_client.dart';
 
@@ -48,6 +49,12 @@ class CallController extends ChangeNotifier {
   // Временное уведомление (например, «учитель запретил показ экрана»).
   String? notice;
   bool hasPeer = false;
+  // Собеседник был в комнате и покинул её (упал ноут, ушёл, перезагрузил
+  // страницу). Когда он вернётся под тем же uid — это будет НОВОЕ peer-
+  // соединение с другим устройством: наш старый _pc уже «протух» (удалённое
+  // описание от прежнего собеседника, ICE в dead), поэтому вместо повторного
+  // offer по нему мы соберём соединение заново (_restartCall).
+  bool _peerLeft = false;
   bool capturingMedia = false;
   bool remoteSpeaking = false;
   bool micBusy = false;
@@ -67,6 +74,21 @@ class CallController extends ChangeNotifier {
   final StreamController<Map<String, dynamic>> _drawEvents =
       StreamController<Map<String, dynamic>>.broadcast();
   Stream<Map<String, dynamic>> get drawEvents => _drawEvents.stream;
+
+  // Сообщения чата от собеседника (свои страница показывает сразу).
+  final StreamController<Map<String, dynamic>> _chatEvents =
+      StreamController<Map<String, dynamic>>.broadcast();
+  Stream<Map<String, dynamic>> get chatEvents => _chatEvents.stream;
+
+  // Вспышки реакций: сообщение собеседника с полями emoji/from.
+  final StreamController<Map<String, dynamic>> _reactionEvents =
+      StreamController<Map<String, dynamic>>.broadcast();
+  Stream<Map<String, dynamic>> get reactionEvents => _reactionEvents.stream;
+
+  // Скрины доски от собеседника (base64 PNG). Свои страница показывает сразу.
+  final StreamController<Map<String, dynamic>> _boardImageEvents =
+      StreamController<Map<String, dynamic>>.broadcast();
+  Stream<Map<String, dynamic>> get boardImageEvents => _boardImageEvents.stream;
 
   final RTCVideoRenderer localRenderer = RTCVideoRenderer();
   final RTCVideoRenderer remoteRenderer = RTCVideoRenderer();
@@ -210,6 +232,11 @@ class CallController extends ChangeNotifier {
           uid: uid,
           name: name,
           isTeacher: isTeacher,
+          // Свежий Firebase ID-токен в момент подключения: он живёт ~час. Если
+          // Firebase не авторизован (dev) — getToken вернёт null, и серверная
+          // сигнализация примет соединение без проверки (см. fallback в main.go).
+          getToken: () async =>
+              await FirebaseAuth.instance.currentUser?.getIdToken(),
         );
       _client = client;
       await client.connect();
@@ -846,14 +873,24 @@ class CallController extends ChangeNotifier {
         notifyListeners();
         break;
       case 'peer-joined':
+        final hadPeerBefore = hasPeer;
         hasPeer = true;
         final joinedName = data['name'] as String?;
         if (joinedName != null && joinedName.isNotEmpty) {
           remoteName = joinedName;
         }
         _diag('Второй участник вошёл в комнату.');
-        _sendDeviceState();
-        _maybeSendOffer();
+        // Возврат собеседника после ухода (упал ноут, вышел) или замена его
+        // устройства: старый _pc «протух» (удалённое описание от прежнего
+        // собеседника, ICE в dead), новый offer по нему не наладит связь.
+        // Собираем peer-соединение заново — offer/answer улетят уже по нему.
+        if ((_peerLeft || hadPeerBefore) && _pcReady) {
+          _peerLeft = false;
+          await _restartCall();
+        } else {
+          _sendDeviceState();
+          _maybeSendOffer();
+        }
         notifyListeners();
         break;
       case 'peers':
@@ -956,6 +993,16 @@ class CallController extends ChangeNotifier {
       case 'draw':
         _drawEvents.add(data);
         break;
+      case 'chat':
+        // Сообщение собеседника: отдаём странице как есть (там имя/текст).
+        _chatEvents.add(data);
+        break;
+      case 'reaction':
+        _reactionEvents.add(data);
+        break;
+      case 'board-image':
+        _boardImageEvents.add(data);
+        break;
       case 'offer':
         // Встречный offer перебивает наш незавершённый — отвечаем на него.
         _offerInFlight = false;
@@ -1006,6 +1053,7 @@ class CallController extends ChangeNotifier {
       case 'peer-leave':
         _offerInFlight = false;
         hasPeer = false;
+        _peerLeft = true;
         remoteName = null;
         remoteMicEnabled = true;
         remoteCameraEnabled = true;
@@ -1521,6 +1569,29 @@ class CallController extends ChangeNotifier {
     _client?.send('draw', extra: {'clear': true});
   }
 
+  // --- Чат ---
+
+  /// Отправляет собеседнику текстовое сообщение чата.
+  void sendChatMessage(String text, {String? name}) {
+    final trimmed = text.trim();
+    if (trimmed.isEmpty) return;
+    _client?.send('chat', extra: {'text': trimmed, 'name': name ?? ''});
+  }
+
+  /// Отправляет собеседнику скрин доски (PNG в base64).
+  void sendBoardImage(String base64Png) {
+    if (base64Png.isEmpty) return;
+    _client?.send('board-image', extra: {'image': base64Png});
+  }
+
+  // --- Реакции ---
+
+  /// Отправляет собеседнику эмоциональную реакцию (эмодзи) по образцу Zoom.
+  void sendReaction(String emoji) {
+    if (emoji.isEmpty) return;
+    _client?.send('reaction', extra: {'emoji': emoji});
+  }
+
   // --- Диагностика устройств (диалог «Проверить оборудование») ---
   Future<List<String>> deviceReport() async {
     final lines = <String>[];
@@ -1581,6 +1652,9 @@ class CallController extends ChangeNotifier {
     await _signalSub?.cancel();
     await _connSub?.cancel();
     await _drawEvents.close();
+    await _boardImageEvents.close();
+    await _chatEvents.close();
+    await _reactionEvents.close();
     await _client?.dispose();
     _client = null;
 

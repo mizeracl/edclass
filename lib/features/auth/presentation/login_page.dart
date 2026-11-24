@@ -1,5 +1,8 @@
+import 'dart:async';
+
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
@@ -16,13 +19,44 @@ class _LoginPageState extends ConsumerState<LoginPage> {
   final _formKey = GlobalKey<FormState>();
   final _emailController = TextEditingController();
   final _passwordController = TextEditingController();
+  final _emailFocus = FocusNode();
   bool _obscurePassword = true;
   bool _isLoading = false;
+
+  @override
+  void initState() {
+    super.initState();
+    // Фокус на поле Email задаём ПОСЛЕ отрисовки экрана: autofocus-запрос
+    // в момент построения отбивается IME-сервером (PHASE_CLIENT_VIEW_SERVED,
+    // окно ещё не обслужено InputMethodManager), и клавиатура не появляется,
+    // пока пользователь не тапнет по полю. Пытаемся несколько раз с паузами —
+    // на холодном старте Android первый запрос стабильно теряется.
+    _tryShowKeyboardSoon();
+  }
+
+  void _tryShowKeyboardSoon() {
+    Future<void> attempt(Duration delay) async {
+      await Future<void>.delayed(delay);
+      if (!mounted) return;
+      _emailFocus.requestFocus();
+      if (_emailFocus.hasFocus) {
+        unawaited(SystemChannels.textInput.invokeMethod<void>('TextInput.show'));
+      }
+    }
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      attempt(const Duration(milliseconds: 100));
+      attempt(const Duration(milliseconds: 350));
+      attempt(const Duration(milliseconds: 800));
+      attempt(const Duration(milliseconds: 1500));
+    });
+  }
 
   @override
   void dispose() {
     _emailController.dispose();
     _passwordController.dispose();
+    _emailFocus.dispose();
     super.dispose();
   }
 
@@ -110,7 +144,9 @@ class _LoginPageState extends ConsumerState<LoginPage> {
                   // Email field
                   TextFormField(
                     controller: _emailController,
+                    focusNode: _emailFocus,
                     keyboardType: TextInputType.emailAddress,
+                    textInputAction: TextInputAction.next,
                     autofillHints: const [AutofillHints.email],
                     decoration: const InputDecoration(
                       labelText: 'Email',
@@ -133,6 +169,7 @@ class _LoginPageState extends ConsumerState<LoginPage> {
                   TextFormField(
                     controller: _passwordController,
                     obscureText: _obscurePassword,
+                    textInputAction: TextInputAction.done,
                     autofillHints: const [AutofillHints.password],
                     decoration: InputDecoration(
                       labelText: 'Пароль',
